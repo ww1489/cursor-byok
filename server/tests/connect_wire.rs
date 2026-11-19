@@ -138,3 +138,55 @@ async fn bidi_append_gzip_body_is_decompressed_before_protobuf_decode() {
     assert!(text.contains("BidiAppend contains no AgentClientMessage"));
     assert!(!text.contains("protobuf decode error"));
 }
+
+#[tokio::test]
+async fn bidi_append_accepts_binary_agent_client_message() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let clients = NetworkClients::new(store.clone());
+    let registry = TransportRegistry::new(
+        store,
+        Arc::new(fake_provider::FakeProvider::default()),
+        PromptCompiler::new(assets),
+    );
+    // Clients with binary appends enabled send the serialized
+    // `AgentClientMessage` in `data_binary` instead of hex `data`.
+    let message = pb::AgentClientMessage {
+        message: Some(pb::agent_client_message::Message::RunRequest(
+            pb::AgentRunRequest {
+                requested_model: Some(pb::RequestedModel {
+                    model_id: "plugin:fixture/provider/model".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )),
+    };
+    let wire = ai::BidiAppendRequest {
+        request_id: Some(ai::BidiRequestId {
+            request_id: "binary-request".into(),
+        }),
+        append_seqno: 1,
+        data_binary: message.encode_to_vec(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+
+    let response = cursor::router(registry, clients)
+        .unwrap()
+        .oneshot(
+            Request::post("/aiserver.v1.BidiService/BidiAppend")
+                .header(header::CONTENT_TYPE, "application/proto")
+                .body(Body::from(wire))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
