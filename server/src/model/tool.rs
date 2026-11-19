@@ -33,9 +33,7 @@ pub fn normalize_json_integers(value: Value) -> Value {
     match value {
         Value::Number(number) if !number.is_i64() && !number.is_u64() => match number.as_f64() {
             Some(float)
-                if float.fract() == 0.0
-                    && float >= i64::MIN as f64
-                    && float <= i64::MAX as f64 =>
+                if float.fract() == 0.0 && float >= i64::MIN as f64 && float <= i64::MAX as f64 =>
             {
                 Value::Number((float as i64).into())
             }
