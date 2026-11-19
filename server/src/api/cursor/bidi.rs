@@ -160,23 +160,27 @@ pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
         .map(|id| id.request_id.as_str())
         .filter(|id| !id.is_empty())
         .ok_or_else(|| Error::Protocol("BidiAppend request_id is required".into()))?;
+    Ok(DecodedAppend {
+        request_id: request_id.into(),
+        seqno: request.append_seqno,
+        message: agent::AgentClientMessage::decode(append_payload(request)?.as_slice())?,
+    })
+}
+
+/// Cursor serializes the same `AgentClientMessage` two ways: clients that keep
+/// binary appends off send it hex encoded in `data`, while clients that turn
+/// them on send the raw protobuf bytes in `data_binary`. Accept both.
+fn append_payload(request: &ai::BidiAppendRequest) -> Result<Vec<u8>> {
     if !request.data_binary.is_empty() {
-        return Err(Error::Protocol(
-            "BidiAppend data_binary is not part of the captured protocol".into(),
-        ));
+        return Ok(request.data_binary.clone());
     }
     if request.data.is_empty() {
         return Err(Error::Protocol(
             "BidiAppend contains no AgentClientMessage".into(),
         ));
     }
-    let payload = hex::decode(&request.data)
-        .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))?;
-    Ok(DecodedAppend {
-        request_id: request_id.into(),
-        seqno: request.append_seqno,
-        message: agent::AgentClientMessage::decode(payload.as_slice())?,
-    })
+    hex::decode(&request.data)
+        .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))
 }
 
 pub async fn append(
@@ -208,4 +212,114 @@ pub async fn append(
         })
         .await?;
     Ok(ai::BidiAppendResponse {})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_request(model_id: &str) -> agent::AgentClientMessage {
+        agent::AgentClientMessage {
+            message: Some(agent::agent_client_message::Message::RunRequest(
+                agent::AgentRunRequest {
+                    requested_model: Some(agent::RequestedModel {
+                        model_id: model_id.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
+    fn append_request(data: &str, data_binary: Vec<u8>) -> ai::BidiAppendRequest {
+        ai::BidiAppendRequest {
+            data: data.into(),
+            request_id: Some(ai::BidiRequestId {
+                request_id: "request-id".into(),
+            }),
+            append_seqno: 1,
+            data_binary,
+        }
+    }
+
+    #[test]
+    fn hex_payload_decodes_agent_client_message() {
+        let message = run_request("plugin:demo/openai/model");
+        let decoded = decode(&append_request(
+            &hex::encode(message.encode_to_vec()),
+            Vec::new(),
+        ))
+        .expect("hex append decodes");
+
+        assert_eq!(decoded.message, message);
+        assert_eq!(decoded.model_id(), Some("plugin:demo/openai/model"));
+    }
+
+    #[test]
+    fn binary_payload_decodes_agent_client_message() {
+        let message = run_request("plugin:demo/openai/model");
+        let decoded =
+            decode(&append_request("", message.encode_to_vec())).expect("binary append decodes");
+
+        assert_eq!(decoded.request_id, "request-id");
+        assert_eq!(decoded.seqno, 1);
+        assert_eq!(decoded.message, message);
+        assert_eq!(decoded.model_id(), Some("plugin:demo/openai/model"));
+    }
+
+    #[test]
+    fn binary_payload_matches_hex_payload() {
+        let message = run_request("plugin:demo/openai/model");
+        let from_hex = decode(&append_request(
+            &hex::encode(message.encode_to_vec()),
+            Vec::new(),
+        ))
+        .expect("hex append decodes");
+        let from_binary =
+            decode(&append_request("", message.encode_to_vec())).expect("binary append decodes");
+
+        assert_eq!(from_hex.message, from_binary.message);
+    }
+
+    #[test]
+    fn binary_payload_wins_when_both_are_present() {
+        let binary = run_request("plugin:demo/binary");
+        let hex_encoded = run_request("plugin:demo/hex");
+        let decoded = decode(&append_request(
+            &hex::encode(hex_encoded.encode_to_vec()),
+            binary.encode_to_vec(),
+        ))
+        .expect("append decodes");
+
+        assert_eq!(decoded.model_id(), Some("plugin:demo/binary"));
+    }
+
+    #[test]
+    fn append_without_payload_is_rejected() {
+        let error = decode_rejection(append_request("", Vec::new()));
+
+        assert!(error.contains("contains no AgentClientMessage"));
+    }
+
+    #[test]
+    fn malformed_hex_payload_is_rejected() {
+        let error = decode_rejection(append_request("zz", Vec::new()));
+
+        assert!(error.contains("invalid BidiAppend hex"));
+    }
+
+    #[test]
+    fn malformed_binary_payload_is_rejected() {
+        let error = decode_rejection(append_request("", vec![0x0a]));
+
+        assert!(error.contains("protobuf decode error"));
+    }
+
+    fn decode_rejection(request: ai::BidiAppendRequest) -> String {
+        match decode(&request) {
+            Ok(decoded) => panic!("append decoded unexpectedly: {}", decoded.request_id),
+            Err(error) => error.to_string(),
+        }
+    }
 }
