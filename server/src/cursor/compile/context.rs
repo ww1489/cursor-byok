@@ -12,7 +12,7 @@ use crate::{
         protocol::proto::agent::v1 as pb, services::context_sync::RequestContextSynchronizer,
         tools::runtime::McpRoute,
     },
-    model::{normalize_tool_name, ToolDefinition},
+    model::{normalize_json_integers, normalize_tool_name, ToolDefinition},
     store::BlobId,
     Error, Result,
 };
@@ -492,6 +492,7 @@ pub fn dynamic_mcp(
                 Error::Protocol(format!("MCP tool {} is missing input schema", wire.name))
             })?),
         };
+        let parameters = normalize_json_integers(parameters);
         let parameters = normalize_mcp_parameters(&wire.name, parameters)?;
         let name = normalize_tool_name(&wire.name);
         let definition = ToolDefinition {
@@ -625,5 +626,77 @@ mod tests {
         let mut context = pb::RequestContext::default();
         merge_local_rules(&mut context, &directory.path().join("nested/rules"));
         assert!(context.non_file_rules.is_empty());
+    }
+
+    #[test]
+    fn dynamic_mcp_schemas_carry_integer_keywords_as_integers() {
+        use prost_types::{value::Kind, Struct, Value as ProstValue};
+
+        let object = |fields: Vec<(&str, ProstValue)>| ProstValue {
+            kind: Some(Kind::StructValue(Struct {
+                fields: fields
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value))
+                    .collect(),
+            })),
+        };
+        let number = |value: f64| ProstValue {
+            kind: Some(Kind::NumberValue(value)),
+        };
+        let text = |value: &str| ProstValue {
+            kind: Some(Kind::StringValue(value.to_string())),
+        };
+        // Protobuf `Value` only carries doubles, so `minLength: 1` arrives as
+        // the number 1.0 no matter how the schema was serialized.
+        let schema = object(vec![
+            ("type", text("object")),
+            (
+                "properties",
+                object(vec![(
+                    "rootPath",
+                    object(vec![("type", text("string")), ("minLength", number(1.0))]),
+                )]),
+            ),
+        ]);
+
+        let request = pb::AgentRunRequest {
+            mcp_tools: Some(pb::McpTools {
+                mcp_tools: vec![pb::McpToolDefinition {
+                    name: "cursor-app-control-move_agent_to_cloned_root".into(),
+                    input_schema: Some(schema),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        let context = pb::RequestContext {
+            tools: vec![pb::McpToolDefinition {
+                name: "lookup".into(),
+                input_schema_json: Some(
+                    r#"{"type":"object","properties":{"limit":{"type":"number","maximum":10.0}}}"#
+                        .into(),
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let compiled = dynamic_mcp(&request, &context).unwrap();
+
+        let app_control = &compiled["cursor-app-control-move_agent_to_cloned_root"].1;
+        assert_eq!(
+            app_control.parameters,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"rootPath": {"type": "string", "minLength": 1}},
+            })
+        );
+        assert_eq!(
+            compiled["lookup"].1.parameters,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"limit": {"type": "number", "maximum": 10}},
+            })
+        );
     }
 }
